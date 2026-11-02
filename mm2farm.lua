@@ -4,7 +4,7 @@
 --  GUI: Wind UI | Executor: Delta
 --  Меню: Right Shift (на телефоне — кнопка-перо после закрытия)
 -- ═══════════════════════════════════════════════════════════════
-print("[CL] START — Crows Lite загружается")
+print("[CL] START — Crows Lite v3 (фикс фермы/войда/флинга + anti-afk)")
 
 -- глушим старый инстанс, если перезапускаешь скрипт
 getgenv().CL_RUN = false
@@ -142,8 +142,12 @@ local AutoFarmSystem = {
     AutoReset = false, CollectedCount = 0, CoinTarget = 0,
     Target = nil, LastTouch = 0, NoclipCache = {},
     TweenMode = false, TweenSpeed = 35, YDepth = 6,
+    NoclipActive = false, HoverCF = nil, LastSafeCF = nil,
 }
 getgenv().CL_FarmRef = AutoFarmSystem
+
+-- флаг активного флинга: ферма замирает, анти-флинг не мешает
+local flinging = false
 
 local FARM_SPEED = 23
 local DOWN_RISE_XZ = 4
@@ -182,22 +186,27 @@ end
 
 local function available_coins()
     local list = {}
-    -- 1) самый точный способ (из сурса): CoinContainer → Coin_Server
-    local map = getMap()
-    local cont = map and map:FindFirstChild("CoinContainer")
-    if cont then
-        for _, c in ipairs(cont:GetChildren()) do
-            if c.Name == "Coin_Server" and not c:FindFirstChild("CollectedCoin") then
-                local p = coin_part(c)
-                if p then list[#list + 1] = p end
-            end
+    -- 1) тег CoinVisual — так ищет РАБОЧАЯ полная версия Crows Hub (проверено на этом executor)
+    local okTag, tagged = pcall(function()
+        return game:GetService("CollectionService"):GetTagged("CoinVisual")
+    end)
+    if okTag and tagged then
+        for _, v in ipairs(tagged) do
+            if coin_available(v) then list[#list + 1] = v end
         end
     end
-    -- 2) запасной способ: тег CoinVisual
+    -- 2) Coin_Server в CoinContainer (свежий сурс-скрипт; у монеты должен быть TouchInterest)
     if #list == 0 then
-        local cs = game:GetService("CollectionService")
-        for _, v in ipairs(cs:GetTagged("CoinVisual")) do
-            if coin_available(v) then list[#list + 1] = v end
+        local map = getMap()
+        local cont = map and map:FindFirstChild("CoinContainer")
+        if cont then
+            for _, c in ipairs(cont:GetChildren()) do
+                if c.Name == "Coin_Server" and not c:FindFirstChild("CollectedCoin")
+                    and c:FindFirstChild("TouchInterest") then
+                    local p = coin_part(c)
+                    if p then list[#list + 1] = p end
+                end
+            end
         end
     end
     -- 3) последний фолбэк: скан по имени
@@ -252,12 +261,69 @@ local function set_farm_noclip(on, lying)
     end
 end
 
--- страховка: движок любит вернуть CanCollide — применяем каждый физ-шаг, пока фарм включён
+-- страховка: движок любит вернуть CanCollide — применяем каждый физ-шаг,
+-- но только пока ноклип реально нужен (иначе в Normal проваливаемся сквозь пол)
 RunService.Stepped:Connect(function()
-    if AutoFarmSystem.Enabled and getChar(LocalPlayer) then
+    if AutoFarmSystem.Enabled and AutoFarmSystem.NoclipActive and getChar(LocalPlayer) then
         set_farm_noclip(true, farm_is_lying())
     end
 end)
+
+-- жёсткая фиксация позиции (Safe без монет/таргета): не даёт утонуть в войд
+local function hover_hold(hrp, lying)
+    if not AutoFarmSystem.HoverCF then AutoFarmSystem.HoverCF = hrp.CFrame end
+    local cf = CFrame.new(AutoFarmSystem.HoverCF.Position)
+    if lying then cf = cf * CFrame.Angles(-math.pi * 0.5, 0, 0) end
+    pcall(function()
+        hrp.CFrame = cf
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end)
+end
+
+-- выключение фарма без падения сквозь пол:
+-- если мы под полом (Safe) — сначала поднимаемся наверх с ноклипом, там возвращаем коллизии
+local safeDisableBusy = false
+local lastFloorY, lastFloorYT = nil, 0
+local function farm_safe_disable()
+    local hrp = farm_hrp()
+    if safeDisableBusy then return end
+    if not hrp then set_farm_noclip(false) return end
+    -- уровень пола берём по монете (или спавну), кэш на 2 сек — чтобы не сканировать карту каждый тик
+    local nowC = os.clock()
+    if not lastFloorY or nowC - lastFloorYT > 2 then
+        lastFloorY = nil
+        local c0 = available_coins()[1]
+        if c0 then lastFloorY = c0.Position.Y end
+        if not lastFloorY then
+            local map = getMap()
+            local sp = map and map:FindFirstChild("Spawns")
+            local s0 = sp and sp:FindFirstChildWhichIsA("BasePart", true)
+            if s0 then lastFloorY = s0.Position.Y end
+        end
+        lastFloorYT = nowC
+    end
+    local floorY = lastFloorY
+    if not floorY or hrp.Position.Y > floorY - 2 then
+        set_farm_noclip(false) -- мы над полом — просто вернуть коллизии
+        return
+    end
+    -- мы под полом: поднимаемся наверх с ноклипом, там возвращаем коллизии
+    safeDisableBusy = true
+    task.spawn(function()
+        pcall(function()
+            local pos = Vector3.new(hrp.Position.X, floorY + 4, hrp.Position.Z)
+            for _ = 1, 15 do
+                set_farm_noclip(true, false)
+                hrp.CFrame = CFrame.new(pos)
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                task.wait(0.03)
+            end
+        end)
+        set_farm_noclip(false)
+        safeDisableBusy = false
+    end)
+end
 
 local function murderer_hrp()
     local m = getMurderer()
@@ -311,6 +377,7 @@ local function fire_touch(coin)
 end
 
 local function farm_move(hrp, dest, dt)
+    AutoFarmSystem.HoverCF = nil -- движение сбрасывает пин позиции
     local dir = dest - hrp.Position
     local dist = dir.Magnitude
     local speed = AutoFarmSystem.TweenMode and (AutoFarmSystem.TweenSpeed or 35) or FARM_SPEED
@@ -371,137 +438,178 @@ local function farm_reset()
     touchCounts = {}
     blockedCoins = {}
     AutoFarmSystem.NoclipCache = {}
+    AutoFarmSystem.HoverCF = nil
+    AutoFarmSystem.LastSafeCF = nil
 end
 
 -- ═══ ГЛАВНЫЙ ЦИКЛ ФАРМА ═══
 local lastFrame = os.clock()
+local lastDiag = 0
+
+-- один шаг фермы: вынесен в функцию, чтобы pcall-ить каждую итерацию —
+-- любая ошибка больше НЕ убивает ферму навсегда, а пишется в F9 и цикл живёт
+local function farm_iteration(now, dt)
+    -- чистим старые метки
+    for coin, t in pairs(touchedCoins) do
+        if not coin.Parent or now - t > 3 then touchedCoins[coin] = nil end
+    end
+    for coin, t in pairs(blockedCoins) do
+        if not coin.Parent or now - t > 15 then blockedCoins[coin] = nil end
+    end
+    for coin in pairs(touchCounts) do
+        if not coin.Parent then touchCounts[coin] = nil end
+    end
+
+    if not AutoFarmSystem.Enabled then return end
+
+    local hrp = farm_hrp()
+    if not hrp then return end
+
+    -- спасение из войда: помним последнюю нормальную позицию, ниже порога — возвращаем
+    local py = hrp.Position.Y
+    if py > -100 then
+        AutoFarmSystem.LastSafeCF = hrp.CFrame
+    elseif py < -250 and AutoFarmSystem.LastSafeCF then
+        pcall(function()
+            hrp.CFrame = AutoFarmSystem.LastSafeCF + Vector3.new(0, 3, 0)
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end)
+        AutoFarmSystem.Target = nil
+        return
+    end
+
+    -- флинг активен: ферма замирает (иначе дёргает персонажа и ломает флинг)
+    if flinging then
+        AutoFarmSystem.Target = nil
+        return
+    end
+
+    -- цель по монетам (0 = без лимита)
+    if AutoFarmSystem.CoinTarget > 0 and AutoFarmSystem.CollectedCount >= AutoFarmSystem.CoinTarget then
+        AutoFarmSystem.Enabled = false
+        farm_safe_disable()
+        if farmToggleRef then pcall(function() farmToggleRef:Set(false) end) end
+        Notify("Auto Farm", "Цель собрана: " .. AutoFarmSystem.CollectedCount .. " монет!", nil, 4)
+        if AutoFarmSystem.AutoReset then
+            local hum = getHum(getChar(LocalPlayer))
+            if hum then pcall(function() hum.Health = 0 end) end
+        end
+        task.wait(1)
+        return
+    end
+
+    local isDown = farm_is_down()
+    local isLying = farm_is_lying()
+    local list = available_coins()
+
+    -- F9-диагностика раз в 2 секунды: видно, что ферма жива и что она видит
+    if now - lastDiag > 2 then
+        lastDiag = now
+        local tname = AutoFarmSystem.Target and AutoFarmSystem.Target.Name or "нет"
+        print(string.format("[CL] farm: режим=%s | монет=%d | таргет=%s | собрано=%d | noclip=%s",
+            AutoFarmSystem.Mode, #list, tname, AutoFarmSystem.CollectedCount,
+            tostring(AutoFarmSystem.NoclipActive)))
+    end
+
+    if coin_bags_full() then
+        if AutoFarmSystem.AutoReset then
+            local hum = getHum(getChar(LocalPlayer))
+            if hum then pcall(function() hum.Health = 0 end) end
+        elseif isDown then
+            -- Safe: жёстко висим под полом (пин позиции, не тонем)
+            set_farm_noclip(true, isLying)
+            hover_hold(hrp, isLying)
+        else
+            farm_safe_disable()
+        end
+        task.wait(1)
+        return
+    end
+
+    if #list == 0 then
+        -- монет нет: в Safe висим под полом, в Normal стоим на карте
+        AutoFarmSystem.Target = nil
+        if isDown then
+            set_farm_noclip(true, isLying)
+            hover_hold(hrp, isLying)
+        else
+            farm_safe_disable()
+            task.wait(0.2)
+        end
+        return
+    end
+
+    local mhrp = AutoFarmSystem.AvoidMurder and murderer_hrp() or nil
+    local mpos = mhrp and mhrp.Position or nil
+
+    -- таргет сбрасываем если монета собралась/помечена
+    if not AutoFarmSystem.Target or not coin_available(AutoFarmSystem.Target)
+        or touchedCoins[AutoFarmSystem.Target] then
+        AutoFarmSystem.Target = nearest_coin(hrp.Position, list)
+    end
+
+    if AutoFarmSystem.Target then
+        set_farm_noclip(true, isLying)
+        local cpos = AutoFarmSystem.Target.Position
+        local dest = cpos
+
+        if isDown then
+            -- Safe: летим под полом на глубине YDepth ниже монеты
+            local xz = flat_dist(hrp.Position, cpos)
+            local safe_to_rise = (not mpos) or flat_dist(hrp.Position, mpos) > RISE_SAFE_DIST
+            if xz <= DOWN_RISE_XZ and safe_to_rise then
+                fire_touch(AutoFarmSystem.Target)
+                AutoFarmSystem.Target = nil
+                if realFireTouch then
+                    -- тач срабатывает через пол — остаёмся на глубине, не выскакиваем
+                    dest = Vector3.new(cpos.X, cpos.Y - AutoFarmSystem.YDepth, cpos.Z)
+                else
+                    -- нет firetouchinterest — поднимаемся к монете по-честному
+                    dest = cpos
+                end
+            else
+                dest = Vector3.new(cpos.X, cpos.Y - AutoFarmSystem.YDepth, cpos.Z)
+            end
+        elseif (cpos - hrp.Position).Magnitude <= 6 then
+            fire_touch(AutoFarmSystem.Target)
+            AutoFarmSystem.Target = nil
+        end
+
+        if AutoFarmSystem.Target or isDown then
+            dest = avoid_steer(hrp.Position, dest, mpos)
+            farm_move(hrp, dest, dt)
+        end
+    elseif mpos then
+        set_farm_noclip(true, isLying)
+        local away = Vector3.new(hrp.Position.X - mpos.X, 0, hrp.Position.Z - mpos.Z)
+        if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) end
+        away = away.Unit
+        farm_move(hrp, hrp.Position + away * 40, dt)
+    else
+        -- таргета нет (все монеты затроганы/заблокированы):
+        -- в Safe жёстко висим под полом, в Normal стоим на карте
+        if isDown then
+            set_farm_noclip(true, isLying)
+            hover_hold(hrp, isLying)
+        else
+            farm_safe_disable()
+            task.wait(0.2)
+        end
+    end
+end
+
 task.spawn(function()
     while true do
         if not getgenv().CL_RUN then break end
         local now = os.clock()
         local dt = math.min(now - lastFrame, 0.1)
         lastFrame = now
-
-        -- чистим старые метки
-        for coin, t in pairs(touchedCoins) do
-            if not coin.Parent or now - t > 3 then touchedCoins[coin] = nil end
-        end
-        for coin, t in pairs(blockedCoins) do
-            if not coin.Parent or now - t > 15 then blockedCoins[coin] = nil end
-        end
-        for coin in pairs(touchCounts) do
-            if not coin.Parent then touchCounts[coin] = nil end
-        end
-
-        if AutoFarmSystem.Enabled then
-            -- цель по монетам (0 = без лимита)
-            if AutoFarmSystem.CoinTarget > 0 and AutoFarmSystem.CollectedCount >= AutoFarmSystem.CoinTarget then
-                AutoFarmSystem.Enabled = false
-                set_farm_noclip(false)
-                if farmToggleRef then pcall(function() farmToggleRef:Set(false) end) end
-                Notify("Auto Farm", "Цель собрана: " .. AutoFarmSystem.CollectedCount .. " монет!", nil, 4)
-                if AutoFarmSystem.AutoReset then
-                    local hum = getHum(getChar(LocalPlayer))
-                    if hum then pcall(function() hum.Health = 0 end) end
-                end
-                task.wait(1)
-                continue
-            end
-
-            local hrp = farm_hrp()
-            if hrp then
-                local isDown = farm_is_down()
-                local isLying = farm_is_lying()
-                local list = available_coins()
-
-                if coin_bags_full() then
-                    if AutoFarmSystem.AutoReset then
-                        local hum = getHum(getChar(LocalPlayer))
-                        if hum then pcall(function() hum.Health = 0 end) end
-                    elseif isDown then
-                        -- Safe: висим на месте под полом (антигравитация)
-                        pcall(function()
-                            hrp.CFrame = hrp.CFrame
-                            hrp.AssemblyLinearVelocity = Vector3.zero
-                            hrp.AssemblyAngularVelocity = Vector3.zero
-                        end)
-                    else
-                        set_farm_noclip(false)
-                    end
-                    task.wait(1)
-                    continue
-                end
-
-                if #list > 0 then
-                    local mhrp = AutoFarmSystem.AvoidMurder and murderer_hrp() or nil
-                    local mpos = mhrp and mhrp.Position or nil
-
-                    -- таргет сбрасываем если монета собралась/помечена
-                    if not AutoFarmSystem.Target or not coin_available(AutoFarmSystem.Target)
-                        or touchedCoins[AutoFarmSystem.Target] then
-                        AutoFarmSystem.Target = nearest_coin(hrp.Position, list)
-                    end
-
-                    if AutoFarmSystem.Target then
-                        set_farm_noclip(true, isLying)
-                        local cpos = AutoFarmSystem.Target.Position
-                        local dest = cpos
-
-                        if isDown then
-                            -- Safe: летим под полом, поднимаемся только к монете
-                            local xz = flat_dist(hrp.Position, cpos)
-                            local safe_to_rise = (not mpos) or flat_dist(hrp.Position, mpos) > RISE_SAFE_DIST
-                            if xz <= DOWN_RISE_XZ and safe_to_rise then
-                                dest = cpos
-                                fire_touch(AutoFarmSystem.Target)
-                                AutoFarmSystem.Target = nil
-                            else
-                                dest = Vector3.new(cpos.X, cpos.Y - AutoFarmSystem.YDepth, cpos.Z)
-                            end
-                        elseif (cpos - hrp.Position).Magnitude <= 6 then
-                            fire_touch(AutoFarmSystem.Target)
-                            AutoFarmSystem.Target = nil
-                        end
-
-                        if AutoFarmSystem.Target or isDown then
-                            dest = avoid_steer(hrp.Position, dest, mpos)
-                            farm_move(hrp, dest, dt)
-                        end
-                    elseif mpos then
-                        set_farm_noclip(true, isLying)
-                        local away = Vector3.new(hrp.Position.X - mpos.X, 0, hrp.Position.Z - mpos.Z)
-                        if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) end
-                        away = away.Unit
-                        farm_move(hrp, hrp.Position + away * 40, dt)
-                    else
-                        -- таргета нет (все монеты затроганы/заблокированы):
-                        -- в Safe висим под полом, в Normal стоим на карте
-                        if isDown then
-                            pcall(function()
-                                hrp.CFrame = hrp.CFrame
-                                hrp.AssemblyLinearVelocity = Vector3.zero
-                                hrp.AssemblyAngularVelocity = Vector3.zero
-                            end)
-                        else
-                            set_farm_noclip(false)
-                            task.wait(0.2)
-                        end
-                    end
-                else
-                    -- монет нет: в Safe висим под полом, в Normal стоим на карте
-                    AutoFarmSystem.Target = nil
-                    if isDown then
-                        pcall(function()
-                            hrp.CFrame = hrp.CFrame
-                            hrp.AssemblyLinearVelocity = Vector3.zero
-                            hrp.AssemblyAngularVelocity = Vector3.zero
-                        end)
-                    else
-                        set_farm_noclip(false)
-                        task.wait(0.2)
-                    end
-                end
-            end
+        -- pcall: ошибка внутри больше не убивает ферму — пишем в F9 и продолжаем
+        local ok, err = pcall(farm_iteration, now, dt)
+        if not ok then
+            warn("[CL] FARM ERROR: " .. tostring(err))
+            AutoFarmSystem.Target = nil
         end
         task.wait(0.03)
     end
@@ -543,7 +651,7 @@ task.spawn(function()
 end)
 
 -- ═══ ANTI-FLING (порт из full) ═══
-local flinging = false -- пока сами флим — анти-флинг не мешает
+-- flinging объявлен выше (нужен ферме для паузы во время флинга)
 local AntiFling = {
     On = true, MaxVel = 500, ClearMovers = true, DisableEnemyCollide = true,
 }
@@ -807,6 +915,35 @@ getgenv().CL_DoFling = doFling
 local function stopFling()
     getgenv().CL_FlingStop = true
     flinging = false
+    -- мгновенная зачистка: скорость, BodyMovers, камера (иначе после Стоп продолжаем лететь)
+    task.spawn(function()
+        local char = getChar(LocalPlayer)
+        local hrp = getHRP(char)
+        local hum = getHum(char)
+        if hrp then
+            pcall(function()
+                for _, obj in pairs(char:GetDescendants()) do
+                    if obj:IsA("BodyVelocity") or obj:IsA("BodyAngularVelocity")
+                        or obj:IsA("LinearVelocity") or obj:IsA("AngularVelocity") then
+                        obj:Destroy()
+                    end
+                end
+                hrp.AssemblyAngularVelocity = Vector3.zero
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.Velocity = Vector3.zero
+                hrp.RotVelocity = Vector3.zero
+            end)
+        end
+        if hum then
+            pcall(function()
+                hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+                hum.PlatformStand = false
+            end)
+        end
+        if workspace.CurrentCamera and hum then
+            pcall(function() workspace.CurrentCamera.CameraSubject = hum end)
+        end
+    end)
     Notify("Fling", "Stopped", nil, 2)
 end
 
@@ -1081,6 +1218,26 @@ task.spawn(function()
     end
 end)
 
+-- ═══ ANTI-AFK (не даёт кикнуть за 20 минут бездействия) ═══
+local AntiAFK = { On = true }
+task.spawn(function()
+    local okVU, VU = pcall(function() return game:GetService("VirtualUser") end)
+    if not okVU or not VU then
+        warn("[CL] Anti-AFK: VirtualUser недоступен")
+        return
+    end
+    LocalPlayer.Idled:Connect(function()
+        if AntiAFK.On then
+            pcall(function()
+                VU:CaptureController()
+                VU:ClickButton2(Vector2.new())
+            end)
+            print("[CL] Anti-AFK: был простой — отправлен виртуальный ввод")
+        end
+    end)
+    print("[CL] Anti-AFK: активен")
+end)
+
 -- ═══════════════════════════════════════════════════════════════
 --  WIND UI
 -- ═══════════════════════════════════════════════════════════════
@@ -1167,11 +1324,11 @@ farmToggleRef = FarmTab:Toggle({
     Callback = function(v)
         AutoFarmSystem.Enabled = v
         if v then
+            farm_reset()
             AutoFarmSystem.CollectedCount = 0
-            touchedCoins = {}
             Notify("Auto Farm", "Старт! Метод: " .. AutoFarmSystem.Mode, nil, 3)
         else
-            set_farm_noclip(false)
+            farm_safe_disable()
         end
     end,
 })
@@ -1184,7 +1341,7 @@ FarmTab:Dropdown({
     Callback = function(v)
         AutoFarmSystem.Mode = v
         AutoFarmSystem.Target = nil
-        set_farm_noclip(false)
+        farm_safe_disable()
     end,
 })
 
@@ -1222,6 +1379,13 @@ FarmTab:Toggle({
     Desc = "Умирает, чтобы начать сбор заново",
     Value = false,
     Callback = function(v) AutoFarmSystem.AutoReset = v end,
+})
+
+FarmTab:Toggle({
+    Title = "Anti-AFK",
+    Desc = "Не даёт кикнуть за простой (20+ минут без действий)",
+    Value = true,
+    Callback = function(v) AntiAFK.On = v end,
 })
 
 FarmTab:Section({ Title = "Coin Aura" })
@@ -1322,5 +1486,3 @@ ProtectTab:Toggle({
 Window:SelectTab(1)
 print("[CL] Crows Lite готов — все системы запущены")
 Notify("Crows Lite", "Загружен! Right Shift / кнопка-перо — открыть меню", nil, 4)
-
-  
