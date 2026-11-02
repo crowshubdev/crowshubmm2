@@ -4,7 +4,7 @@
 --  GUI: Wind UI | Executor: Delta
 --  Меню: Right Shift (на телефоне — кнопка-перо после закрытия)
 -- ═══════════════════════════════════════════════════════════════
-print("[CL] START — Crows Lite v3 (фикс фермы/войда/флинга + anti-afk)")
+print("[CL] START — Crows Lite v4 (фикс цели/авто-килла, обход мардера, TP лобби/катка, noclip, inf jump, FOV, скорость)")
 
 -- глушим старый инстанс, если перезапускаешь скрипт
 getgenv().CL_RUN = false
@@ -139,7 +139,7 @@ end
 -- ═══════════════════════════════════════════════════════════════
 local AutoFarmSystem = {
     Enabled = false, Mode = "Normal", AvoidMurder = false,
-    AutoReset = false, CollectedCount = 0, CoinTarget = 0,
+    AfterCollect = "Ничего", CollectedCount = 0, CoinTarget = 0,
     Target = nil, LastTouch = 0, NoclipCache = {},
     TweenMode = false, TweenSpeed = 35, YDepth = 6,
     NoclipActive = false, HoverCF = nil, LastSafeCF = nil,
@@ -156,6 +156,11 @@ local RISE_SAFE_DIST = 20
 local touchedCoins = {} -- [coin] = время touch
 local blockedCoins = {} -- [coin] = время блока (застряла 3 раза)
 local touchCounts = {}  -- [coin] = сколько раз touch не сработал
+local countedCoins = {} -- [coin] = true (уже засчитана как СОБРАННАЯ — анти-дубль)
+local MURD_COIN_DIST = 35 -- монеты ближе этого к мардеру пропускаем (обход стоящего мардера)
+local roundDone = false   -- конец сбора (килл/ТП) отрабатывает 1 раз за раунд
+local tryAutoKill = nil   -- назначается в секции Auto Kill
+local maybeRoundDone = nil
 local farmToggleRef = nil -- тоггл из GUI (синхронизация при достижении цели)
 
 local function farm_is_down()
@@ -221,18 +226,30 @@ local function available_coins()
     end
     return list
 end
-local function nearest_coin(pos, list)
-    local best, bd = nil, math.huge
+local function nearest_coin(pos, list, mpos)
     local now = os.clock()
-    for _, v in ipairs(list) do
-        local tT = touchedCoins[v]
-        local tB = blockedCoins[v]
-        if not (tT and now - tT < 1.5) and not (tB and now - tB < 10) then
-            local d = (v.Position - pos).Magnitude
-            if d < bd then bd = d best = v end
+    -- проход: выбирает ближайшую монету с фильтрами
+    local function pass(skipMurder)
+        local best, bd = nil, math.huge
+        for _, v in ipairs(list) do
+            local tT = touchedCoins[v]
+            local tB = blockedCoins[v]
+            if not (tT and now - tT < 1.5) and not (tB and now - tB < 10) then
+                -- обход мардера: монета прямо у него — летим к другой
+                if not (skipMurder and mpos and flat_dist(v.Position, mpos) <= MURD_COIN_DIST) then
+                    local d = (v.Position - pos).Magnitude
+                    if d < bd then bd = d best = v end
+                end
+            end
         end
+        return best
     end
-    return best
+    -- если мардер стоит у ВСЕХ оставшихся монет — берём просто ближайшую (не стоим вечно)
+    if mpos then
+        local b = pass(true)
+        if b then return b end
+    end
+    return pass(false)
 end
 
 local function set_farm_noclip(on, lying)
@@ -252,12 +269,14 @@ local function set_farm_noclip(on, lying)
                 p.CanCollide = false
             end
         end
+        AutoFarmSystem.NoclipActive = true
     else
         if hum then pcall(function() hum.PlatformStand = false end) end
         for p, v in pairs(AutoFarmSystem.NoclipCache) do
             if p and p.Parent then pcall(function() p.CanCollide = v end) end
         end
         AutoFarmSystem.NoclipCache = {}
+        AutoFarmSystem.NoclipActive = false
     end
 end
 
@@ -312,13 +331,16 @@ local function farm_safe_disable()
     safeDisableBusy = true
     task.spawn(function()
         pcall(function()
-            local pos = Vector3.new(hrp.Position.X, floorY + 4, hrp.Position.Z)
+            local pos = Vector3.new(hrp.Position.X, floorY + 6, hrp.Position.Z)
             for _ = 1, 15 do
                 set_farm_noclip(true, false)
                 hrp.CFrame = CFrame.new(pos)
                 hrp.AssemblyLinearVelocity = Vector3.zero
                 task.wait(0.03)
             end
+            -- пауза С ноклипом: физика успевает вытолкнуть из геометрии,
+            -- иначе возврат коллизий внутри плиты = провал сквозь пол
+            task.wait(0.15)
         end)
         set_farm_noclip(false)
         safeDisableBusy = false
@@ -353,6 +375,18 @@ local function touch_targets(coin)
     return list
 end
 
+-- считаем только РЕАЛЬНО собранные монеты: через 0.6с после touch проверяем,
+-- что монета исчезла. Неудачные попытки (застрявшие) больше не надувают счётчик
+local function count_if_gone(coin)
+    if countedCoins[coin] then return end
+    task.delay(0.6, function()
+        if not coin_available(coin) and not countedCoins[coin] then
+            countedCoins[coin] = true
+            AutoFarmSystem.CollectedCount = AutoFarmSystem.CollectedCount + 1
+        end
+    end)
+end
+
 local function fire_touch(coin)
     if not realFireTouch or not coin or not coin.Parent then return false end
     local now = os.clock()
@@ -372,7 +406,7 @@ local function fire_touch(coin)
         blockedCoins[coin] = now
         touchCounts[coin] = nil
     end
-    AutoFarmSystem.CollectedCount = AutoFarmSystem.CollectedCount + 1
+    count_if_gone(coin)
     return true
 end
 
@@ -437,9 +471,13 @@ local function farm_reset()
     touchedCoins = {}
     touchCounts = {}
     blockedCoins = {}
+    countedCoins = {}
     AutoFarmSystem.NoclipCache = {}
     AutoFarmSystem.HoverCF = nil
     AutoFarmSystem.LastSafeCF = nil
+    -- ФИКС: счётчик собранных монет и флаг «конец сбора» сбрасываются каждый раунд
+    AutoFarmSystem.CollectedCount = 0
+    roundDone = false
 end
 
 -- ═══ ГЛАВНЫЙ ЦИКЛ ФАРМА ═══
@@ -458,6 +496,9 @@ local function farm_iteration(now, dt)
     end
     for coin in pairs(touchCounts) do
         if not coin.Parent then touchCounts[coin] = nil end
+    end
+    for coin in pairs(countedCoins) do
+        if not coin.Parent then countedCoins[coin] = nil end
     end
 
     if not AutoFarmSystem.Enabled then return end
@@ -487,15 +528,7 @@ local function farm_iteration(now, dt)
 
     -- цель по монетам (0 = без лимита)
     if AutoFarmSystem.CoinTarget > 0 and AutoFarmSystem.CollectedCount >= AutoFarmSystem.CoinTarget then
-        AutoFarmSystem.Enabled = false
-        farm_safe_disable()
-        if farmToggleRef then pcall(function() farmToggleRef:Set(false) end) end
-        Notify("Auto Farm", "Цель собрана: " .. AutoFarmSystem.CollectedCount .. " монет!", nil, 4)
-        if AutoFarmSystem.AutoReset then
-            local hum = getHum(getChar(LocalPlayer))
-            if hum then pcall(function() hum.Health = 0 end) end
-        end
-        task.wait(1)
+        if maybeRoundDone then maybeRoundDone("target") end
         return
     end
 
@@ -513,23 +546,19 @@ local function farm_iteration(now, dt)
     end
 
     if coin_bags_full() then
-        if AutoFarmSystem.AutoReset then
-            local hum = getHum(getChar(LocalPlayer))
-            if hum then pcall(function() hum.Health = 0 end) end
-        elseif isDown then
-            -- Safe: жёстко висим под полом (пин позиции, не тонем)
-            set_farm_noclip(true, isLying)
-            hover_hold(hrp, isLying)
-        else
-            farm_safe_disable()
-        end
-        task.wait(1)
+        -- сумка полна = конец сбора: стоп + авто-килл + «после сбора» (один раз за раунд)
+        if maybeRoundDone then maybeRoundDone("bags") end
         return
     end
 
     if #list == 0 then
-        -- монет нет: в Safe висим под полом, в Normal стоим на карте
         AutoFarmSystem.Target = nil
+        -- мы собирали и монет не осталось (раунд ещё идёт) → конец сбора
+        if AutoFarmSystem.CollectedCount > 0 then
+            if maybeRoundDone then maybeRoundDone("exhausted") end
+            return
+        end
+        -- монет ещё нет (начало раунда): в Safe висим под полом, в Normal стоим
         if isDown then
             set_farm_noclip(true, isLying)
             hover_hold(hrp, isLying)
@@ -543,10 +572,16 @@ local function farm_iteration(now, dt)
     local mhrp = AutoFarmSystem.AvoidMurder and murderer_hrp() or nil
     local mpos = mhrp and mhrp.Position or nil
 
+    -- обход СТОЯЩЕГО мардера: он встал у нашей монеты → сброс и путь к другой
+    if AutoFarmSystem.Target and mpos
+        and flat_dist(AutoFarmSystem.Target.Position, mpos) <= MURD_COIN_DIST then
+        AutoFarmSystem.Target = nil
+    end
+
     -- таргет сбрасываем если монета собралась/помечена
     if not AutoFarmSystem.Target or not coin_available(AutoFarmSystem.Target)
         or touchedCoins[AutoFarmSystem.Target] then
-        AutoFarmSystem.Target = nearest_coin(hrp.Position, list)
+        AutoFarmSystem.Target = nearest_coin(hrp.Position, list, mpos)
     end
 
     if AutoFarmSystem.Target then
@@ -558,15 +593,18 @@ local function farm_iteration(now, dt)
             -- Safe: летим под полом на глубине YDepth ниже монеты
             local xz = flat_dist(hrp.Position, cpos)
             local safe_to_rise = (not mpos) or flat_dist(hrp.Position, mpos) > RISE_SAFE_DIST
-            if xz <= DOWN_RISE_XZ and safe_to_rise then
+            if xz <= DOWN_RISE_XZ then
                 fire_touch(AutoFarmSystem.Target)
                 AutoFarmSystem.Target = nil
                 if realFireTouch then
-                    -- тач срабатывает через пол — остаёмся на глубине, не выскакиваем
+                    -- тач бьёт через пол: мардер рядом НЕ мешает — остаёмся на глубине
+                    -- (раньше тут был стоп «ждать мардера» — из-за него ферма замирала)
                     dest = Vector3.new(cpos.X, cpos.Y - AutoFarmSystem.YDepth, cpos.Z)
-                else
+                elseif safe_to_rise then
                     -- нет firetouchinterest — поднимаемся к монете по-честному
                     dest = cpos
+                else
+                    dest = Vector3.new(cpos.X, cpos.Y - AutoFarmSystem.YDepth, cpos.Z)
                 end
             else
                 dest = Vector3.new(cpos.X, cpos.Y - AutoFarmSystem.YDepth, cpos.Z)
@@ -641,6 +679,7 @@ task.spawn(function()
                             realFireTouch(root, c, 0)
                             realFireTouch(root, c, 1)
                         end)
+                        count_if_gone(c) -- аура тоже честно считает собранные монеты
                         touched = true
                     end
                 end
@@ -981,40 +1020,64 @@ local function keKillAll()
     local knife = keGetKnife()
     if not knife then return 0 end
     local c = getChar(LocalPlayer)
+    local hum = getHum(c)
+    local myHRP = c and getHRP(c)
+    if not (hum and myHRP) then return 0 end
+
+    -- нож должен быть В РУКАХ, иначе сервер не примет удар
     if knife.Parent ~= c then
-        local hum = getHum(c)
-        if hum then
-            pcall(function() hum:EquipTool(knife) end)
-            task.wait(0.2)
-            knife = keGetKnife()
-        end
+        pcall(function() hum:EquipTool(knife) end)
+        task.wait(0.25)
+        knife = keGetKnife()
+        if not knife then return 0 end
     end
-    if not knife then return 0 end
 
     local ev = knife:FindFirstChild("Events")
     local st = ev and ev:FindFirstChild("KnifeStabbed")
     local to = ev and ev:FindFirstChild("HandleTouched")
     local handle = knife:FindFirstChild("Handle")
+    if not handle then return 0 end
 
+    local startCF = myHRP.CFrame
+    set_farm_noclip(true, false) -- без коллизий: телепорты к жертвам не залипают в стенах
+
+    -- ФИКС «килл не убивает»: раньше ремоуты стреляли с места, а сервер MM2
+    -- проверяет дистанцию удара. Теперь телепортируем к каждой жертве.
     local n = 0
-    if st then pcall(function() st:FireServer() end) end
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer then
-            local pc = getChar(plr)
-            local ph = getHum(pc)
-            local phrp = pc and getHRP(pc)
-            if ph and ph.Health > 0 and phrp then
-                if to then pcall(function() to:FireServer(phrp) end) end
-                if handle then
-                    pcall(function()
-                        realFireTouch(handle, phrp, 1)
-                        realFireTouch(handle, phrp, 0)
-                    end)
+    for _ = 1, 2 do -- два прохода: добираем выживших с первого
+        if st then pcall(function() st:FireServer() end) end
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then
+                local pc = getChar(plr)
+                local ph = getHum(pc)
+                local phrp = pc and getHRP(pc)
+                if ph and ph.Health > 0 and phrp then
+                    pcall(function() myHRP.CFrame = phrp.CFrame * CFrame.new(0, 0, 3) end)
+                    set_farm_noclip(true, false)
+                    task.wait(0.08)
+                    if to then pcall(function() to:FireServer(phrp) end) end
+                    if realFireTouch then
+                        pcall(function()
+                            realFireTouch(handle, phrp, 1)
+                            realFireTouch(handle, phrp, 0)
+                        end)
+                    end
+                    n = n + 1
+                    task.wait(0.12)
                 end
-                n = n + 1
             end
         end
+        task.wait(0.25)
     end
+
+    -- возвращаемся на точку старта (если ещё живы)
+    local c2 = getChar(LocalPlayer)
+    local hrp2 = c2 and getHRP(c2)
+    local hum2 = c2 and getHum(c2)
+    if hrp2 and hum2 and hum2.Health > 0 then
+        pcall(function() hrp2.CFrame = startCF end)
+    end
+    set_farm_noclip(false)
     return n
 end
 
@@ -1057,23 +1120,72 @@ task.spawn(function()
     end
 end)
 
--- цикл Auto Kill (собрал цель / полную сумку → убить всех)
+-- авто-килл: цель собрана / сумка полна / монет не осталось (и раунд идёт).
+-- Вызывается из фермы И из страховочного цикла — флаг DoneThisRound не даёт задвоить
+tryAutoKill = function()
+    if not AutoKE.On or AutoKE.DoneThisRound then return end
+    if getMap() == nil then return end -- лобби — ничего не делаем
+    local reached = (AutoFarmSystem.CoinTarget > 0 and AutoFarmSystem.CollectedCount >= AutoFarmSystem.CoinTarget)
+        or coin_bags_full()
+        or (AutoFarmSystem.CollectedCount > 0 and #available_coins() == 0)
+    if not reached then return end
+    AutoKE.DoneThisRound = true
+    local knife = keGetKnife()
+    if not knife then
+        Notify("Auto Kill", "Нет ножа — авто-килл работает только за Murderer", nil, 4)
+        return
+    end
+    Notify("Auto Kill", "Монеты собраны — убиваю всех!", nil, 4)
+    flinging = true -- ферма и анти-флинг ждут, пока идут телепорт-удары
+    local ok, n = pcall(keKillAll)
+    flinging = false
+    if ok then
+        Notify("Auto Kill", "Атаковано: " .. tostring(n), nil, 3)
+    else
+        warn("[CL] Auto Kill error: " .. tostring(n))
+    end
+end
+
+-- ЕДИНЫЙ конец сбора (1 раз за раунд): стоп фарма → авто-килл → «после сбора»
+maybeRoundDone = function(reason)
+    if roundDone then return end
+    roundDone = true
+    task.spawn(function()
+        if AutoFarmSystem.Enabled then
+            AutoFarmSystem.Enabled = false
+            farm_safe_disable()
+            if farmToggleRef then pcall(function() farmToggleRef:Set(false) end) end
+        end
+        if reason == "target" then
+            Notify("Auto Farm", "Цель собрана: " .. AutoFarmSystem.CollectedCount .. " монет!", nil, 4)
+        else
+            Notify("Auto Farm", "Монеты закончились!", nil, 3)
+        end
+        task.wait(0.5) -- даём подняться из-под пола
+        tryAutoKill()
+        task.wait(0.6)
+        local after = AutoFarmSystem.AfterCollect or "Ничего"
+        if after == "Телепорт в лобби" then
+            local cf = getgenv().CL_LobbyCF
+            local hrp = farm_hrp()
+            if cf and hrp then
+                pcall(function() hrp.CFrame = cf + Vector3.new(0, 3, 0) end)
+                Notify("Auto Farm", "Телепорт в лобби", nil, 3)
+            else
+                Notify("Auto Farm", "Лобби ещё не запомнено — телепорт пропущен", nil, 3)
+            end
+        elseif after == "Респавн" then
+            local hum = getHum(getChar(LocalPlayer))
+            if hum then pcall(function() hum.Health = 0 end) end
+        end
+    end)
+end
+
+-- страховочный цикл: работает и БЕЗ включённого фарма (например, сбор через Coin Aura)
 task.spawn(function()
     while task.wait(0.5) do
         if not getgenv().CL_RUN then break end
-        if AutoKE.On and not AutoKE.DoneThisRound then
-            local collected = AutoFarmSystem.CollectedCount
-            local amMurd = keGetKnife() ~= nil
-            local reached = (AutoFarmSystem.CoinTarget > 0 and collected >= AutoFarmSystem.CoinTarget)
-                or coin_bags_full()
-            if amMurd and reached then
-                AutoKE.DoneThisRound = true
-                Notify("Auto Kill", "Монеты собраны — убиваю всех!", nil, 4)
-                task.wait(0.3)
-                local n = keKillAll()
-                Notify("Auto Kill", "Атаковано: " .. n, nil, 3)
-            end
-        end
+        if tryAutoKill then pcall(tryAutoKill) end
     end
 end)
 
@@ -1238,6 +1350,87 @@ task.spawn(function()
     print("[CL] Anti-AFK: активен")
 end)
 
+-- ═══ СКОРОСТЬ ХОДЬБЫ (анти-сброс: нож/роль/инструменты не замедляют) ═══
+local WalkSpeedCfg = { On = false, Value = 16 }
+local wsHookedChar = nil
+local function applyWalkSpeed(hum)
+    if WalkSpeedCfg.On and hum and hum.Health > 0 and hum.WalkSpeed ~= WalkSpeedCfg.Value then
+        pcall(function() hum.WalkSpeed = WalkSpeedCfg.Value end)
+    end
+end
+task.spawn(function()
+    while task.wait(0.2) do
+        if not getgenv().CL_RUN then break end
+        pcall(function()
+            local c = getChar(LocalPlayer)
+            local hum = getHum(c)
+            applyWalkSpeed(hum)
+            -- мгновенный откат: игра ставит свою скорость (взял нож и т.п.) → возвращаем свою
+            if c and c ~= wsHookedChar then
+                wsHookedChar = c
+                if hum then
+                    hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+                        applyWalkSpeed(hum)
+                    end)
+                end
+            end
+        end)
+    end
+end)
+
+-- ═══ FOV (поле зрения камеры) ═══
+local FOVCfg = { On = false, Value = 70 }
+task.spawn(function()
+    while task.wait(0.2) do
+        if not getgenv().CL_RUN then break end
+        if FOVCfg.On then
+            pcall(function()
+                local cam = workspace.CurrentCamera
+                if cam and cam.FieldOfView ~= FOVCfg.Value then cam.FieldOfView = FOVCfg.Value end
+            end)
+        end
+    end
+end)
+
+-- ═══ NOCLIP (ручной — работает и когда фарм выключен) ═══
+local NoclipOn = false
+RunService.Stepped:Connect(function()
+    if NoclipOn and getgenv().CL_RUN then
+        local c = getChar(LocalPlayer)
+        if c then
+            for _, p in ipairs(c:GetChildren()) do
+                if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
+            end
+        end
+    end
+end)
+
+-- ═══ INFINITE JUMP ═══
+local InfJumpOn = false
+pcall(function()
+    game:GetService("UserInputService").JumpRequest:Connect(function()
+        if InfJumpOn and getgenv().CL_RUN then
+            local hum = getHum(getChar(LocalPlayer))
+            if hum and hum.Health > 0 then
+                pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+            end
+        end
+    end)
+end)
+
+-- ═══ ЗАПОМИНАЕМ ПОЗИЦИЮ ЛОББИ (в лобби нет карты — getMap() == nil) ═══
+task.spawn(function()
+    while task.wait(1) do
+        if not getgenv().CL_RUN then break end
+        pcall(function()
+            local hrp = farm_hrp()
+            if hrp and getMap() == nil and hrp.Position.Y > -100 then
+                getgenv().CL_LobbyCF = hrp.CFrame
+            end
+        end)
+    end
+end)
+
 -- ═══════════════════════════════════════════════════════════════
 --  WIND UI
 -- ═══════════════════════════════════════════════════════════════
@@ -1245,7 +1438,7 @@ local Window = nil
 local okWin = pcall(function()
     Window = WindUI:CreateWindow({
         Title = "Crows Lite",
-        Author = "MM2 Auto Farm • by Crows Hub",
+        Author = "MM2 Auto Farm • by CrowsHubDev ver 1.1",
         Icon = "feather",
         Folder = "CrowsLite",
         Size = UDim2.fromOffset(560, 380),
@@ -1283,6 +1476,7 @@ pcall(function() Window:SetToggleKey(Enum.KeyCode.RightShift) end)
 local FarmTab = Window:Tab({ Title = "Фарм", Icon = "coins", Desc = "Авто-фарм монет" })
 local CombatTab = Window:Tab({ Title = "Бой", Icon = "crosshair", Desc = "Пистолет, килл, аим" })
 local ProtectTab = Window:Tab({ Title = "Защита", Icon = "shield", Desc = "Анти-флинг" })
+local CharTab = Window:Tab({ Title = "Персонаж", Icon = "user", Desc = "Скорость, FOV, noclip, прыжок" })
 
 -- слайдер + ручной ввод одним блоком
 local function addNum(tab, title, desc, min, max, def, setter)
@@ -1314,7 +1508,7 @@ end
 FarmTab:Section({ Title = "Авто Фарм" })
 FarmTab:Paragraph({
     Title = "Crows Lite",
-    Desc = "Normal — сбор по карте\nSafe Standing — под полом в полный рост\nSafe Lying — под полом лёжа\nRight Shift — меню (на телефоне кнопка-перо)",
+    Desc = "Normal — сбор по карте\nSafe Standing — под полом в полный рост\nSafe Lying — под полом лёжа\nПосле сбора — авто-килл и ТП в лобби\nRight Shift — меню (на телефоне кнопка-перо)",
 })
 
 farmToggleRef = FarmTab:Toggle({
@@ -1374,11 +1568,74 @@ FarmTab:Toggle({
     end,
 })
 
-FarmTab:Toggle({
-    Title = "Респавн при полной сумке",
-    Desc = "Умирает, чтобы начать сбор заново",
-    Value = false,
-    Callback = function(v) AutoFarmSystem.AutoReset = v end,
+FarmTab:Dropdown({
+    Title = "После сбора",
+    Desc = "Когда цель собрана или монеты закончились",
+    Values = { "Ничего", "Телепорт в лобби", "Респавн" },
+    Value = "Ничего",
+    Callback = function(v) AutoFarmSystem.AfterCollect = v end,
+})
+
+FarmTab:Section({ Title = "Телепорт" })
+FarmTab:Button({
+    Title = "ТП в лобби",
+    Desc = "Выключает фарм и переносит в лобби",
+    Callback = function()
+        task.spawn(function()
+            if AutoFarmSystem.Enabled then
+                AutoFarmSystem.Enabled = false
+                if farmToggleRef then pcall(function() farmToggleRef:Set(false) end) end
+                farm_safe_disable()
+                task.wait(0.7) -- даём подняться из-под пола
+            end
+            local cf = getgenv().CL_LobbyCF
+            local hrp = farm_hrp()
+            if cf and hrp then
+                pcall(function() hrp.CFrame = cf + Vector3.new(0, 3, 0) end)
+                Notify("Телепорт", "В лобби!", nil, 2)
+            else
+                Notify("Телепорт", "Лобби ещё не запомнено — побудь в лобби пару секунд", nil, 3)
+            end
+        end)
+    end,
+})
+FarmTab:Button({
+    Title = "ТП в катку",
+    Desc = "На спавн текущей карты (если раунд уже идёт)",
+    Callback = function()
+        task.spawn(function()
+            local map = getMap()
+            local hrp = farm_hrp()
+            if not map or not hrp then
+                Notify("Телепорт", "Сейчас нет катки — раунд не начался", nil, 3)
+                return
+            end
+            local dest = nil
+            local sp = map:FindFirstChild("Spawns")
+            local s0 = sp and sp:FindFirstChildWhichIsA("BasePart", true)
+            if s0 then
+                dest = s0.CFrame + Vector3.new(0, 5, 0)
+            else
+                -- фолбэк: любой живой игрок (он точно на карте)
+                for _, p in ipairs(Players:GetPlayers()) do
+                    if p ~= LocalPlayer then
+                        local h = getHum(getChar(p))
+                        local phrp = getChar(p) and getHRP(getChar(p))
+                        if h and h.Health > 0 and phrp then
+                            dest = phrp.CFrame + Vector3.new(0, 4, 0)
+                            break
+                        end
+                    end
+                end
+            end
+            if dest then
+                pcall(function() hrp.CFrame = dest end)
+                Notify("Телепорт", "В катке!", nil, 2)
+            else
+                Notify("Телепорт", "Не нашёл точку входа на карту", nil, 3)
+            end
+        end)
+    end,
 })
 
 FarmTab:Toggle({
@@ -1410,7 +1667,7 @@ CombatTab:Toggle({
 CombatTab:Section({ Title = "Убийство" })
 CombatTab:Toggle({
     Title = "Убить всех при цели",
-    Desc = "Собрал цель / полную сумку → убиваешь всех ножом (нужна роль Murderer)",
+    Desc = "Собрал цель / монеты кончились → телепорт-удары ножом (нужна роль Murderer)",
     Value = false,
     Callback = function(v) AutoKE.On = v end,
 })
@@ -1460,6 +1717,55 @@ CombatTab:Button({
     Callback = stopFling,
 })
 
+CombatTab:Section({ Title = "Флинг игрока" })
+local flingDropdownRef = nil
+local flingTargetName = nil
+local function playerNames()
+    local list = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then list[#list + 1] = p.Name end
+    end
+    if #list == 0 then list[1] = "(нет игроков)" end
+    return list
+end
+local flingNames0 = playerNames()
+flingDropdownRef = CombatTab:Dropdown({
+    Title = "Игрок",
+    Desc = "Кого выбросить с карты",
+    Values = flingNames0,
+    Value = flingNames0[1],
+    Callback = function(v) flingTargetName = v end,
+})
+CombatTab:Button({
+    Title = "Флинг выбранного",
+    Desc = "Выбрасывает игрока из списка",
+    Callback = function()
+        local p = (flingTargetName and flingTargetName ~= "(нет игроков)") and Players:FindFirstChild(flingTargetName)
+        if p then
+            doFling(p)
+        else
+            Notify("Fling", "Игрок не найден — обнови список", nil, 3)
+        end
+    end,
+})
+CombatTab:Button({
+    Title = "Обновить список игроков",
+    Desc = "Подтянуть новых игроков в дропдаун",
+    Callback = function()
+        local names = playerNames()
+        local done = false
+        pcall(function()
+            flingDropdownRef:Refresh(names)
+            done = true
+        end)
+        if done then
+            Notify("Fling", "Список обновлён", nil, 2)
+        else
+            Notify("Fling", "Refresh не поддержался — перезагрузи скрипт", nil, 3)
+        end
+    end,
+})
+
 -- ─── ВКЛАДКА ЗАЩИТА ───
 ProtectTab:Section({ Title = "Anti-Fling" })
 ProtectTab:Toggle({
@@ -1480,6 +1786,61 @@ ProtectTab:Toggle({
         AutoFlingDeath.On = v
         if not v then deathFlingPending = false end
     end,
+})
+
+-- ─── ВКЛАДКА ПЕРСОНАЖ ───
+CharTab:Section({ Title = "Камера и скорость" })
+CharTab:Toggle({
+    Title = "Своя скорость ходьбы",
+    Desc = "Мгновенный возврат — взял нож и НЕ стал медленным",
+    Value = false,
+    Callback = function(v)
+        WalkSpeedCfg.On = v
+        if not v then
+            local hum = getHum(getChar(LocalPlayer))
+            if hum then pcall(function() hum.WalkSpeed = 16 end) end
+        end
+    end,
+})
+addNum(CharTab, "Скорость ходьбы", "16 = стандарт игры", 8, 100, 16,
+    function(n)
+        WalkSpeedCfg.Value = n
+        applyWalkSpeed(getHum(getChar(LocalPlayer)))
+    end)
+CharTab:Toggle({
+    Title = "Своя FOV",
+    Desc = "Поле зрения камеры (выключить = вернуть 70)",
+    Value = false,
+    Callback = function(v)
+        FOVCfg.On = v
+        if not v then pcall(function() workspace.CurrentCamera.FieldOfView = 70 end) end
+    end,
+})
+addNum(CharTab, "FOV", "30-120 (стандарт 70)", 30, 120, 70,
+    function(n) FOVCfg.Value = n end)
+
+CharTab:Section({ Title = "Движение" })
+CharTab:Toggle({
+    Title = "Noclip",
+    Desc = "Ходишь сквозь стены (работает без фарма)",
+    Value = false,
+    Callback = function(v)
+        NoclipOn = v
+        if not v then
+            local c = getChar(LocalPlayer)
+            if c then
+                for _, p in ipairs(c:GetChildren()) do
+                    if p:IsA("BasePart") then pcall(function() p.CanCollide = true end) end
+                end
+            end
+        end
+    end,
+})
+CharTab:Toggle({
+    Title = "Infinite Jump",
+    Desc = "Прыгай в воздухе сколько хочешь",
+    Value = false,
+    Callback = function(v) InfJumpOn = v end,
 })
 
 -- ═══ СТАРТ ═══
