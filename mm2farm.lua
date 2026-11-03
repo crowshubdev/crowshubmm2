@@ -1438,12 +1438,12 @@ local Window = nil
 local okWin = pcall(function()
     Window = WindUI:CreateWindow({
         Title = "Crows Lite",
-        Author = "MM2 Auto Farm • by CrowsHubDev ver 1.1",
+        Author = "MM2 Auto Farm • by CrowsHubDev ver 1.1.0",
         Icon = "feather",
         Folder = "CrowsLite",
         Size = UDim2.fromOffset(560, 380),
         ToggleKey = Enum.KeyCode.RightShift,
-        SideBarWidth = 155,
+        SideBarWidth = 185,
     })
 end)
 if not okWin or not Window then
