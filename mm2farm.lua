@@ -4,7 +4,7 @@
 --  GUI: Wind UI | Executor: Delta
 --  Меню: Right Shift (на телефоне — кнопка-перо после закрытия)
 -- ═══════════════════════════════════════════════════════════════
-print("[CL] START — Crows Lite v4 (фикс цели/авто-килла, обход мардера, TP лобби/катка, noclip, inf jump, FOV, скорость)")
+print("[CL] START — Crows Lite v5 (фарм ЖДЁТ монеты в лобби, авто-килл без телепортов как в full, ТП в лобби по координатам)")
 
 -- глушим старый инстанс, если перезапускаешь скрипт
 getgenv().CL_RUN = false
@@ -143,11 +143,15 @@ local AutoFarmSystem = {
     Target = nil, LastTouch = 0, NoclipCache = {},
     TweenMode = false, TweenSpeed = 35, YDepth = 6,
     NoclipActive = false, HoverCF = nil, LastSafeCF = nil,
+    sawCoins = false, -- видели монеты В ЭТОМ раунде (защита от старого счётчика в лобби)
 }
 getgenv().CL_FarmRef = AutoFarmSystem
 
 -- флаг активного флинга: ферма замирает, анти-флинг не мешает
 local flinging = false
+
+-- координаты лобби (проверены игроком): ТП работает сразу, запоминать позицию не нужно
+local CL_LOBBY_CF = CFrame.new(564, 462, 1)
 
 local FARM_SPEED = 23
 local DOWN_RISE_XZ = 4
@@ -477,12 +481,14 @@ local function farm_reset()
     AutoFarmSystem.LastSafeCF = nil
     -- ФИКС: счётчик собранных монет и флаг «конец сбора» сбрасываются каждый раунд
     AutoFarmSystem.CollectedCount = 0
+    AutoFarmSystem.sawCoins = false
     roundDone = false
 end
 
 -- ═══ ГЛАВНЫЙ ЦИКЛ ФАРМА ═══
 local lastFrame = os.clock()
 local lastDiag = 0
+local lastWaitLog = 0 -- троттлинг лога «монет нет — жду»
 
 -- один шаг фермы: вынесен в функцию, чтобы pcall-ить каждую итерацию —
 -- любая ошибка больше НЕ убивает ферму навсегда, а пишется в F9 и цикл живёт
@@ -526,8 +532,11 @@ local function farm_iteration(now, dt)
         return
     end
 
-    -- цель по монетам (0 = без лимита)
-    if AutoFarmSystem.CoinTarget > 0 and AutoFarmSystem.CollectedCount >= AutoFarmSystem.CoinTarget then
+    -- цель по монетам (0 = без лимита). sawCoins: проверяем цель только если в ЭТОМ
+    -- раунде уже видели монеты — иначе старый счётчик прошлого раунда выключал фарм
+    -- прямо в лобби / до спавна монет
+    if AutoFarmSystem.CoinTarget > 0 and AutoFarmSystem.sawCoins
+        and AutoFarmSystem.CollectedCount >= AutoFarmSystem.CoinTarget then
         if maybeRoundDone then maybeRoundDone("target") end
         return
     end
@@ -535,6 +544,7 @@ local function farm_iteration(now, dt)
     local isDown = farm_is_down()
     local isLying = farm_is_lying()
     local list = available_coins()
+    if #list > 0 then AutoFarmSystem.sawCoins = true end
 
     -- F9-диагностика раз в 2 секунды: видно, что ферма жива и что она видит
     if now - lastDiag > 2 then
@@ -545,21 +555,28 @@ local function farm_iteration(now, dt)
             tostring(AutoFarmSystem.NoclipActive)))
     end
 
-    if coin_bags_full() then
-        -- сумка полна = конец сбора: стоп + авто-килл + «после сбора» (один раз за раунд)
+    if getMap() and coin_bags_full() then
+        -- сумка полна = конец сбора: стоп + авто-килл + «после сбора» (один раз за раунд).
+        -- Проверяем только на карте: GUI сумок прошлого раунда не должен срабатывать в лобби
         if maybeRoundDone then maybeRoundDone("bags") end
         return
     end
 
     if #list == 0 then
         AutoFarmSystem.Target = nil
-        -- мы собирали и монет не осталось (раунд ещё идёт) → конец сбора
-        if AutoFarmSystem.CollectedCount > 0 then
+        -- мы собирали В ЭТОМ РАУНДЕ и монет не осталось (раунд ещё идёт) → конец сбора.
+        -- РАНЬШЕ: старый счётчик прошлого раунда выключал фарм прямо в лобби
+        if AutoFarmSystem.sawCoins and AutoFarmSystem.CollectedCount > 0 then
             if maybeRoundDone then maybeRoundDone("exhausted") end
             return
         end
-        -- монет ещё нет (начало раунда): в Safe висим под полом, в Normal стоим
-        if isDown then
+        -- монет ещё нет (лобби или монеты не заспавнились) — ЖДЁМ, фарм остаётся включённым
+        if now - lastWaitLog > 5 then
+            lastWaitLog = now
+            print("[CL] farm: монет нет — жду начала раунда (фарм остаётся включённым)")
+        end
+        -- в лобби под пол не ныряем (нет карты) — просто стоим
+        if isDown and getMap() then
             set_farm_noclip(true, isLying)
             hover_hold(hrp, isLying)
         else
@@ -1007,7 +1024,7 @@ end
 if LocalPlayer.Character then hookHumanoid(LocalPlayer.Character) end
 
 -- ═══ AUTO KILL EVERYONE (порт из full) ═══
-local AutoKE = { On = false, DoneThisRound = false }
+local AutoKE = { On = false, DoneThisRound = false, LastWarn = 0 }
 
 local function keGetKnife()
     local c = getChar(LocalPlayer)
@@ -1021,8 +1038,7 @@ local function keKillAll()
     if not knife then return 0 end
     local c = getChar(LocalPlayer)
     local hum = getHum(c)
-    local myHRP = c and getHRP(c)
-    if not (hum and myHRP) then return 0 end
+    if not (c and hum) then return 0 end
 
     -- нож должен быть В РУКАХ, иначе сервер не примет удар
     if knife.Parent ~= c then
@@ -1036,15 +1052,12 @@ local function keKillAll()
     local st = ev and ev:FindFirstChild("KnifeStabbed")
     local to = ev and ev:FindFirstChild("HandleTouched")
     local handle = knife:FindFirstChild("Handle")
-    if not handle then return 0 end
+    if not (to or (handle and realFireTouch)) then return 0 end
 
-    local startCF = myHRP.CFrame
-    set_farm_noclip(true, false) -- без коллизий: телепорты к жертвам не залипают в стенах
-
-    -- ФИКС «килл не убивает»: раньше ремоуты стреляли с места, а сервер MM2
-    -- проверяет дистанцию удара. Теперь телепортируем к каждой жертве.
-    local n = 0
-    for _ = 1, 2 do -- два прохода: добираем выживших с первого
+    -- КАК В ПОЛНОЙ ВЕРСИИ: никаких телепортов — бьём ремоутами с места,
+    -- персонаж стоит на месте, соседей не пугаем
+    local function stabPass()
+        local killed = 0
         if st then pcall(function() st:FireServer() end) end
         for _, plr in ipairs(Players:GetPlayers()) do
             if plr ~= LocalPlayer then
@@ -1052,32 +1065,36 @@ local function keKillAll()
                 local ph = getHum(pc)
                 local phrp = pc and getHRP(pc)
                 if ph and ph.Health > 0 and phrp then
-                    pcall(function() myHRP.CFrame = phrp.CFrame * CFrame.new(0, 0, 3) end)
-                    set_farm_noclip(true, false)
-                    task.wait(0.08)
                     if to then pcall(function() to:FireServer(phrp) end) end
-                    if realFireTouch then
+                    if handle and realFireTouch then
                         pcall(function()
                             realFireTouch(handle, phrp, 1)
                             realFireTouch(handle, phrp, 0)
                         end)
                     end
-                    n = n + 1
-                    task.wait(0.12)
+                    killed = killed + 1
+                    task.wait(0.08)
                 end
             end
         end
-        task.wait(0.25)
+        return killed
     end
 
-    -- возвращаемся на точку старта (если ещё живы)
+    local n = stabPass()
+    -- страховка: если сервер отклонил часть ударов — второй проход (тоже без телепортов)
+    task.wait(0.6)
     local c2 = getChar(LocalPlayer)
-    local hrp2 = c2 and getHRP(c2)
     local hum2 = c2 and getHum(c2)
-    if hrp2 and hum2 and hum2.Health > 0 then
-        pcall(function() hrp2.CFrame = startCF end)
+    if hum2 and hum2.Health > 0 then
+        local alive = 0
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then
+                local ph = getHum(getChar(plr))
+                if ph and ph.Health > 0 then alive = alive + 1 end
+            end
+        end
+        if alive > 0 then n = n + stabPass() end
     end
-    set_farm_noclip(false)
     return n
 end
 
@@ -1120,25 +1137,30 @@ task.spawn(function()
     end
 end)
 
--- авто-килл: цель собрана / сумка полна / монет не осталось (и раунд идёт).
+-- авто-килл: цель собрана / сумка полна / монеты закончились В ЭТОМ раунде.
+-- sawCoins не даёт киллу стартовать от старого счётчика прошлого раунда
+-- (раньше из-за этого нож бил всех сразу при взятии Knife в начале раунда).
 -- Вызывается из фермы И из страховочного цикла — флаг DoneThisRound не даёт задвоить
 tryAutoKill = function()
     if not AutoKE.On or AutoKE.DoneThisRound then return end
     if getMap() == nil then return end -- лобби — ничего не делаем
-    local reached = (AutoFarmSystem.CoinTarget > 0 and AutoFarmSystem.CollectedCount >= AutoFarmSystem.CoinTarget)
+    local reached = (AutoFarmSystem.CoinTarget > 0 and AutoFarmSystem.sawCoins
+        and AutoFarmSystem.CollectedCount >= AutoFarmSystem.CoinTarget)
         or coin_bags_full()
-        or (AutoFarmSystem.CollectedCount > 0 and #available_coins() == 0)
+        or (AutoFarmSystem.sawCoins and AutoFarmSystem.CollectedCount > 0 and #available_coins() == 0)
     if not reached then return end
-    AutoKE.DoneThisRound = true
     local knife = keGetKnife()
     if not knife then
-        Notify("Auto Kill", "Нет ножа — авто-килл работает только за Murderer", nil, 4)
+        -- ножа ещё нет: DoneThisRound НЕ ставим — как только возьмёшь Knife, килл случится сам
+        if os.clock() - AutoKE.LastWarn > 10 then
+            AutoKE.LastWarn = os.clock()
+            Notify("Auto Kill", "Монеты собраны — жду нож (нужна роль Murderer)", nil, 4)
+        end
         return
     end
+    AutoKE.DoneThisRound = true
     Notify("Auto Kill", "Монеты собраны — убиваю всех!", nil, 4)
-    flinging = true -- ферма и анти-флинг ждут, пока идут телепорт-удары
     local ok, n = pcall(keKillAll)
-    flinging = false
     if ok then
         Notify("Auto Kill", "Атаковано: " .. tostring(n), nil, 3)
     else
@@ -1166,13 +1188,10 @@ maybeRoundDone = function(reason)
         task.wait(0.6)
         local after = AutoFarmSystem.AfterCollect or "Ничего"
         if after == "Телепорт в лобби" then
-            local cf = getgenv().CL_LobbyCF
             local hrp = farm_hrp()
-            if cf and hrp then
-                pcall(function() hrp.CFrame = cf + Vector3.new(0, 3, 0) end)
+            if hrp then
+                pcall(function() hrp.CFrame = CL_LOBBY_CF end)
                 Notify("Auto Farm", "Телепорт в лобби", nil, 3)
-            else
-                Notify("Auto Farm", "Лобби ещё не запомнено — телепорт пропущен", nil, 3)
             end
         elseif after == "Респавн" then
             local hum = getHum(getChar(LocalPlayer))
@@ -1418,18 +1437,7 @@ pcall(function()
     end)
 end)
 
--- ═══ ЗАПОМИНАЕМ ПОЗИЦИЮ ЛОББИ (в лобби нет карты — getMap() == nil) ═══
-task.spawn(function()
-    while task.wait(1) do
-        if not getgenv().CL_RUN then break end
-        pcall(function()
-            local hrp = farm_hrp()
-            if hrp and getMap() == nil and hrp.Position.Y > -100 then
-                getgenv().CL_LobbyCF = hrp.CFrame
-            end
-        end)
-    end
-end)
+-- лобби больше не запоминаем: ТП в лобби идёт по фиксированным координатам CL_LOBBY_CF (564, 462, 1)
 
 -- ═══════════════════════════════════════════════════════════════
 --  WIND UI
@@ -1443,7 +1451,7 @@ local okWin = pcall(function()
         Folder = "CrowsLite",
         Size = UDim2.fromOffset(560, 380),
         ToggleKey = Enum.KeyCode.RightShift,
-        SideBarWidth = 185,
+        SideBarWidth = 155,
     })
 end)
 if not okWin or not Window then
@@ -1588,13 +1596,12 @@ FarmTab:Button({
                 farm_safe_disable()
                 task.wait(0.7) -- даём подняться из-под пола
             end
-            local cf = getgenv().CL_LobbyCF
             local hrp = farm_hrp()
-            if cf and hrp then
-                pcall(function() hrp.CFrame = cf + Vector3.new(0, 3, 0) end)
+            if hrp then
+                pcall(function() hrp.CFrame = CL_LOBBY_CF end)
                 Notify("Телепорт", "В лобби!", nil, 2)
             else
-                Notify("Телепорт", "Лобби ещё не запомнено — побудь в лобби пару секунд", nil, 3)
+                Notify("Телепорт", "Персонаж не найден", nil, 3)
             end
         end)
     end,
@@ -1667,7 +1674,7 @@ CombatTab:Toggle({
 CombatTab:Section({ Title = "Убийство" })
 CombatTab:Toggle({
     Title = "Убить всех при цели",
-    Desc = "Собрал цель / монеты кончились → телепорт-удары ножом (нужна роль Murderer)",
+    Desc = "Собрал цель / монеты кончились → удары ножом БЕЗ телепортов, как в полной версии (нужна роль Murderer)",
     Value = false,
     Callback = function(v) AutoKE.On = v end,
 })
