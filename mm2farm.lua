@@ -4,7 +4,7 @@
 --  GUI: Wind UI | Executor: Delta
 --  Меню: Right Shift (на телефоне — кнопка-перо после закрытия)
 -- ═══════════════════════════════════════════════════════════════
-print("[CL] START — Crows Lite v5 (фарм ЖДЁТ монеты в лобби, авто-килл без телепортов как в full, ТП в лобби по координатам)")
+print("[CL] START — Crows Lite v6 (авто-рестарт: фарм сам включается на новом раунде, авто-килл, ТП в лобби по координатам)")
 
 -- глушим старый инстанс, если перезапускаешь скрипт
 getgenv().CL_RUN = false
@@ -144,6 +144,7 @@ local AutoFarmSystem = {
     TweenMode = false, TweenSpeed = 35, YDepth = 6,
     NoclipActive = false, HoverCF = nil, LastSafeCF = nil,
     sawCoins = false, -- видели монеты В ЭТОМ раунде (защита от старого счётчика в лобби)
+    AutoRestart = true, -- [v6] после конца сбора фарм сам включится на новом раунде
 }
 getgenv().CL_FarmRef = AutoFarmSystem
 
@@ -163,6 +164,7 @@ local touchCounts = {}  -- [coin] = сколько раз touch не срабо�
 local countedCoins = {} -- [coin] = true (уже засчитана как СОБРАННАЯ — анти-дубль)
 local MURD_COIN_DIST = 35 -- монеты ближе этого к мардеру пропускаем (обход стоящего мардера)
 local roundDone = false   -- конец сбора (килл/ТП) отрабатывает 1 раз за раунд
+local autoRestartArmed = false -- [v6] взводится после конца сбора → ловим новый раунд
 local tryAutoKill = nil   -- назначается в секции Auto Kill
 local maybeRoundDone = nil
 local farmToggleRef = nil -- тоггл из GUI (синхронизация при достижении цели)
@@ -1172,8 +1174,9 @@ end
 maybeRoundDone = function(reason)
     if roundDone then return end
     roundDone = true
+    local wasOn = AutoFarmSystem.Enabled
     task.spawn(function()
-        if AutoFarmSystem.Enabled then
+        if wasOn then
             AutoFarmSystem.Enabled = false
             farm_safe_disable()
             if farmToggleRef then pcall(function() farmToggleRef:Set(false) end) end
@@ -1197,8 +1200,33 @@ maybeRoundDone = function(reason)
             local hum = getHum(getChar(LocalPlayer))
             if hum then pcall(function() hum.Health = 0 end) end
         end
+        -- [v6] АВТО-РЕСТАРТ: взводим флаг — как только начнётся новый раунд,
+        -- сторожевой цикл ниже сам включит фарм (тоггл в меню тоже включится)
+        if wasOn and AutoFarmSystem.AutoRestart then
+            autoRestartArmed = true
+            print("[CL] авто-рестарт взведён — жду новый раунд")
+        end
     end)
 end
+
+-- [v6] СТОРОЖЕВОЙ ЦИКЛ АВТО-РЕСТАРТА: фарм сам включается на новом раунде.
+-- Новый раунд = CoinsStarted сбросил roundDone + карта снова в workspace
+-- (значит монеты скоро заспавнятся — фарм включаем, дальше он сам ждёт монеты)
+task.spawn(function()
+    while task.wait(0.5) do
+        if not getgenv().CL_RUN then break end
+        pcall(function()
+            if autoRestartArmed and AutoFarmSystem.AutoRestart
+                and not AutoFarmSystem.Enabled and not roundDone and getMap() then
+                autoRestartArmed = false
+                AutoFarmSystem.Enabled = true
+                if farmToggleRef then pcall(function() farmToggleRef:Set(true) end) end
+                Notify("Auto Farm", "Новый раунд — фарм включён автоматически", nil, 3)
+                print("[CL] авто-рестарт: новый раунд — фарм включён")
+            end
+        end)
+    end
+end)
 
 -- страховочный цикл: работает и БЕЗ включённого фарма (например, сбор через Coin Aura)
 task.spawn(function()
@@ -1446,7 +1474,7 @@ local Window = nil
 local okWin = pcall(function()
     Window = WindUI:CreateWindow({
         Title = "Crows Lite",
-        Author = "MM2 Auto Farm • by CrowsHubDev ver 1.1.0",
+        Author = "MM2 Auto Farm • by CrowsHubDev ver 1.1",
         Icon = "feather",
         Folder = "CrowsLite",
         Size = UDim2.fromOffset(560, 380),
@@ -1516,7 +1544,7 @@ end
 FarmTab:Section({ Title = "Авто Фарм" })
 FarmTab:Paragraph({
     Title = "Crows Lite",
-    Desc = "Normal — сбор по карте\nSafe Standing — под полом в полный рост\nSafe Lying — под полом лёжа\nПосле сбора — авто-килл и ТП в лобби\nRight Shift — меню (на телефоне кнопка-перо)",
+    Desc = "Normal — сбор по карте\nSafe Standing — под полом в полный рост\nSafe Lying — под полом лёжа\nПосле сбора — авто-килл и ТП в лобби\n[v6] Фарм сам включается на новом раунде\nRight Shift — меню (на телефоне кнопка-перо)",
 })
 
 farmToggleRef = FarmTab:Toggle({
@@ -1531,6 +1559,7 @@ farmToggleRef = FarmTab:Toggle({
             Notify("Auto Farm", "Старт! Метод: " .. AutoFarmSystem.Mode, nil, 3)
         else
             farm_safe_disable()
+            autoRestartArmed = false -- [v6] выключил вручную — авто-рестарт отменяется
         end
     end,
 })
@@ -1582,6 +1611,16 @@ FarmTab:Dropdown({
     Values = { "Ничего", "Телепорт в лобби", "Респавн" },
     Value = "Ничего",
     Callback = function(v) AutoFarmSystem.AfterCollect = v end,
+})
+
+FarmTab:Toggle({
+    Title = "Авто-рестарт фарма",
+    Desc = "После конца сбора фарм САМ включится на новом раунде",
+    Value = true,
+    Callback = function(v)
+        AutoFarmSystem.AutoRestart = v
+        if not v then autoRestartArmed = false end
+    end,
 })
 
 FarmTab:Section({ Title = "Телепорт" })
